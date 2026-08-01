@@ -1,0 +1,38 @@
+:root {
+  --void: #0e0a03;
+  --surface: #1a140a;
+  --surface-raised: #241c0f;
+  --ember: #e84d0e;
+  --ember-hot: #ff6b1a;
+  --gold: #f5c842;
+  --blood: #6b0f1a;
+  --rust: #c4602a;
+  --sage: #4a8c7e;
+  --parchment: #ede5d0;
+  --parchment-dim: #8a7a60;
+  --ink-faint: #5a4a30;
+  --border: rgba(237, 229, 208, 0.08);
+  --border-strong: rgba(237, 229, 208, 0.16);
+  --radius: 8px;
+  --radius-card: 14px;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  background: var(--void);
+  color: var(--parchment);
+  font-family: "Space Grotesk", "Inter", -apple-system, sans-serif;
+  font-feature-settings: "tnum" 1;
+}
+
+.mono {
+  font-family: "Space Mono", monospace;
+}
+
+.serif {
+  font-family: Georgia, "Times New Roman", serif;
+}
