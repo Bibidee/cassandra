@@ -1,6 +1,6 @@
 """
 CASSANDRA contract tests, run via gltest against StudioNet
-(chain id 61999, rpc https://studio.genlayer.com/api — see gltest.config.yaml).
+(chain id 61999, rpc https://studio.genlayer.com/api - see gltest.config.yaml).
 
 genlayer-test's `gltest` runner deploys and executes against a real network;
 there is no separate mocked-call test layer, so the build brief's "direct vs
@@ -33,10 +33,16 @@ def deploy_contract():
 
 
 def _submit_test_warning(contract, category="security", prophet_cut_bps=500):
+    # draft_prophecy now fetches source_url and requires the model to verify
+    # it genuinely supports the quote before drafting - example.com won't
+    # pass that check, so tests that call draft_prophecy need a real,
+    # fetchable source whose content actually contains the quoted warning.
     result = contract.submit_warning(
         args=[
-            "https://example.com/audit-report",
-            "The bridge multisig threshold is a single compromised signer away from total fund loss.",
+            "https://rekt.news/ronin-rekt/",
+            "Ronin Network's bridge relied on only 5 of 9 validator signatures to "
+            "authorize withdrawals, allowing an attacker who compromised 5 keys "
+            "to drain 173,600 ETH and 25.5M USDC undetected for six days.",
             category,
             prophet_cut_bps,
         ]
@@ -103,8 +109,8 @@ def test_cannot_provide_liquidity_before_ratification():
     contract = load_fixture(deploy_contract)
     prophecy_id = _submit_test_warning(contract)
 
-    # status is still DRAFTING — draft_prophecy has not been called
-    result = contract.provide_liquidity(args=[prophecy_id, 1000]).transact()
+    # status is still DRAFTING - draft_prophecy has not been called
+    result = contract.provide_liquidity(args=[prophecy_id]).transact(value=1000)
     assert tx_execution_failed(result)
 
 
@@ -119,7 +125,7 @@ def test_cannot_settle_before_resolution():
 def test_operations_on_nonexistent_prophecy_fail():
     contract = load_fixture(deploy_contract)
 
-    result = contract.provide_liquidity(args=[999, 1000]).transact()
+    result = contract.provide_liquidity(args=[999]).transact(value=1000)
     assert tx_execution_failed(result)
 
 
@@ -144,8 +150,8 @@ def test_full_lifecycle_underwrite_and_resolve():
     assert state["prophecy"]["structured_claim"] != ""
 
     lp_contract = contract.connect(accounts[1])
-    liquidity_result = lp_contract.provide_liquidity(args=[prophecy_id, 10000]).transact(
-        wait_transaction_status=TransactionStatus.FINALIZED
+    liquidity_result = lp_contract.provide_liquidity(args=[prophecy_id]).transact(
+        value=10000, wait_transaction_status=TransactionStatus.FINALIZED
     )
     assert tx_execution_succeeded(liquidity_result)
     assert (
@@ -154,8 +160,8 @@ def test_full_lifecycle_underwrite_and_resolve():
     )
 
     buyer_contract = contract.connect(accounts[2])
-    coverage_result = buyer_contract.buy_coverage(args=[prophecy_id, 2000]).transact(
-        wait_transaction_status=TransactionStatus.FINALIZED
+    coverage_result = buyer_contract.buy_coverage(args=[prophecy_id]).transact(
+        value=2000, wait_transaction_status=TransactionStatus.FINALIZED
     )
     assert tx_execution_succeeded(coverage_result)
     assert (
@@ -194,7 +200,7 @@ def test_trigger_resolution_rejected_before_active():
     assert tx_execution_succeeded(draft_result)
 
     # trigger_resolution requires ACTIVE status; without underwriting/coverage
-    # this pool is still RATIFIED, so we expect a rejected transaction here —
+    # this pool is still RATIFIED, so we expect a rejected transaction here -
     # this test exercises the status-machine guard on trigger_resolution.
     resolve_result = contract.trigger_resolution(
         args=[prophecy_id, "https://en.wikipedia.org/wiki/Special:Random"]

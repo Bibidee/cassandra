@@ -16,7 +16,6 @@ STATUS_ACTIVE = "ACTIVE"
 STATUS_RESOLVING = "RESOLVING"
 STATUS_SETTLED = "SETTLED"
 STATUS_DISPUTED = "DISPUTED"
-STATUS_FINAL = "FINAL"
 
 # Per-category evidentiary guidance (design spec section 8, open question 4):
 # gives the drafting LLM a consistent standard per launch vertical instead of
@@ -77,6 +76,37 @@ def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+def _parse_iso_datetime(value: str) -> datetime:
+    """
+    Parses an ISO 8601 date/datetime string (the LLM is asked for plain
+    "YYYY-MM-DD" but may occasionally include a time component) into an
+    aware UTC datetime, so resolution-window checks compare like with like.
+    """
+    try:
+        parsed = datetime.fromisoformat(value)
+    except ValueError:
+        raise gl.vm.UserError(f"EXPECTED: invalid ISO date '{value}' in resolution window")
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed
+
+
+def _strict_bool(value: object, field_name: str) -> bool:
+    """
+    Rejects anything that isn't a literal JSON boolean. `bool("false")` is
+    True in Python (any non-empty string is truthy) - if an LLM response
+    ever returns a stringly-typed "false"/"true", coercing it with plain
+    bool() would silently flip the verdict. This is the strict parser used
+    everywhere a validator's true/false judgment feeds into money movement.
+    """
+    if isinstance(value, bool):
+        return value
+    raise gl.vm.UserError(
+        f"LLM_ERROR: field '{field_name}' must be a JSON boolean, "
+        f"got {type(value).__name__}: {value!r}"
+    )
+
+
 def _parse_json_object(raw: str) -> dict:
     """
     Defensive JSON parse for LLM output (build brief section 3.4): strip
@@ -135,6 +165,7 @@ class ProphecyRecord:
     prophet_cut_bps: u256
     total_coverage: u256
     total_liquidity: u256
+    evidence_url: str  # persisted so an appeal review re-fetches the same evidence
 
 
 class Cassandra(gl.Contract):
@@ -209,6 +240,7 @@ class Cassandra(gl.Contract):
             prophet_cut_bps=u256(prophet_cut_bps),
             total_coverage=u256(0),
             total_liquidity=u256(0),
+            evidence_url="",
         )
 
         prophecy_id = self.prophecy_count
@@ -221,13 +253,20 @@ class Cassandra(gl.Contract):
         return prophecy_id
 
     # ------------------------------------------------------------------
-    # EXTRACTION - draft a falsifiable Prophecy claim from the raw Warning.
-    # Equivalence: custom validator (prompt_comparative), NOT strict_eq.
-    # A leader-drafted claim will never be byte-identical across validators;
-    # what must match is the substantive event class, evidentiary bar and
-    # rough timeframe (build brief section 3.3). Reaching eq_principle
-    # consensus on this write IS the ratification step - no separate
-    # ratify_prophecy call is needed.
+    # EXTRACTION - draft a falsifiable Prophecy claim from the raw Warning,
+    # and VERIFY THE SOURCE first. Equivalence: custom validator
+    # (prompt_non_comparative), NOT strict_eq. A leader-drafted claim will
+    # never be byte-identical across validators; what must match is the
+    # substantive event class, evidentiary bar and rough timeframe (build
+    # brief section 3.3). Reaching eq_principle consensus on this write IS
+    # the ratification step - no separate ratify_prophecy call is needed.
+    #
+    # Source verification: the leader fetches source_url and the model must
+    # confirm warning_quote is genuinely supported by that content before
+    # any claim is drafted - previously source_url was never fetched at all,
+    # so a fabricated or dead source could be ratified and go on to accept
+    # real GEN. If verification fails, this raises and the prophecy stays in
+    # DRAFTING permanently (no state is written, no funds are ever at risk).
     # ------------------------------------------------------------------
     @gl.public.write
     def draft_prophecy(self, prophecy_id: int) -> None:
@@ -242,10 +281,19 @@ class Cassandra(gl.Contract):
             category, DEFAULT_EVIDENTIARY_GUIDANCE
         )
 
-        input_text = f"""
+        def get_input() -> str:
+            try:
+                source_content = gl.nondet.web.render(source_url, mode="text")
+            except Exception as exc:
+                raise gl.vm.UserError(f"EXTERNAL: could not fetch source_url: {exc}")
+            return f"""
 <source_url>
 {source_url}
 </source_url>
+
+<source_content>
+{source_content}
+</source_content>
 
 <category>
 {category}
@@ -261,11 +309,20 @@ class Cassandra(gl.Contract):
 """
 
         task = """
-Draft a structured, falsifiable insurance claim from the public warning above.
-Describe the specific event class this warning predicts, the evidentiary bar
-needed to confirm it occurred, and a reasonable resolution window (ISO 8601
-start/end dates, window length appropriate to the category - days for
-security exploits, months for climate/regulatory).
+Draft a structured, falsifiable insurance claim from the public warning above -
+but first, verify its source.
+
+Step 1 - VERIFY: does source_content genuinely contain or substantively
+support warning_quote (the same claim in substance, not necessarily verbatim)?
+If source_content is empty, unreachable-looking, unrelated to warning_quote,
+or contradicts it, the warning cannot be drafted - set source_verified to
+false and fill the remaining fields with reasonable placeholders (they will
+be ignored).
+
+Step 2 - if verified, describe the specific event class this warning
+predicts, the evidentiary bar needed to confirm it occurred, and a reasonable
+resolution window (ISO 8601 start/end dates, window length appropriate to the
+category - days for security exploits, months for climate/regulatory).
 
 The evidentiary_standard you draft must follow the category_evidentiary_guidance
 provided above - it sets the kind of source validators should require at
@@ -274,6 +331,7 @@ prophecy in the same category rather than being invented ad hoc.
 
 Respond in strict JSON:
 {
+  "source_verified": true or false,
   "structured_claim": "one or two sentences, falsifiable, specific event class",
   "evidentiary_standard": "what kind of evidence would confirm this occurred",
   "resolution_window_start": "YYYY-MM-DD",
@@ -283,19 +341,20 @@ It is mandatory that you respond only using the JSON format above, nothing else.
 """
 
         criteria = """
-The output is valid JSON with exactly the four required keys.
-structured_claim names a specific, falsifiable event class consistent with the
-warning_quote and category - it does not need to match any particular wording.
-evidentiary_standard names a plausible kind of evidence for that category.
-resolution_window_start and resolution_window_end are both valid ISO 8601 dates,
-in order, with a length that is reasonable for the category (days to weeks for
-security exploits, weeks to months for climate/regulatory/systemic claims).
-Accept minor variation in exact wording or exact dates - only reject if the
-claim is not falsifiable, not related to the warning, or the JSON is malformed.
+The output is valid JSON with exactly the five required keys. source_verified
+is a boolean judging whether source_content genuinely supports warning_quote -
+reject only if this judgment is clearly wrong given source_content (e.g. it
+obviously contradicts or has nothing to do with warning_quote). If
+source_verified is true: structured_claim names a specific, falsifiable event
+class consistent with the warning_quote and category - it does not need to
+match any particular wording. evidentiary_standard names a plausible kind of
+evidence for that category. resolution_window_start and resolution_window_end
+are both valid ISO 8601 dates, in order, with a length that is reasonable for
+the category (days to weeks for security exploits, weeks to months for
+climate/regulatory/systemic claims). Accept minor variation in exact wording
+or exact dates - only reject if the claim is not falsifiable, not related to
+the warning, or the JSON is malformed.
 """
-
-        def get_input() -> str:
-            return input_text
 
         raw = gl.eq_principle.prompt_non_comparative(
             get_input,
@@ -304,13 +363,22 @@ claim is not falsifiable, not related to the warning, or the JSON is malformed.
         )
         parsed = _parse_json_object(raw)
         for key in (
+            "source_verified",
             "structured_claim",
             "evidentiary_standard",
             "resolution_window_start",
             "resolution_window_end",
         ):
-            if key not in parsed or not isinstance(parsed[key], str) or not parsed[key]:
-                raise gl.vm.UserError(f"LLM_ERROR: draft_prophecy missing/invalid field '{key}'")
+            if key not in parsed:
+                raise gl.vm.UserError(f"LLM_ERROR: draft_prophecy missing field '{key}'")
+
+        if not _strict_bool(parsed["source_verified"], "source_verified"):
+            raise gl.vm.UserError(
+                "EXPECTED: source_url does not verifiably support the submitted warning_quote"
+            )
+        for key in ("structured_claim", "evidentiary_standard", "resolution_window_start", "resolution_window_end"):
+            if not isinstance(parsed[key], str) or not parsed[key]:
+                raise gl.vm.UserError(f"LLM_ERROR: draft_prophecy invalid field '{key}'")
 
         # Build a brand-new ProphecyRecord and explicitly reassign it into the
         # TreeMap, rather than relying on in-place mutation of the object
@@ -329,6 +397,7 @@ claim is not falsifiable, not related to the warning, or the JSON is malformed.
             prophet_cut_bps=record.prophet_cut_bps,
             total_coverage=record.total_coverage,
             total_liquidity=record.total_liquidity,
+            evidence_url=record.evidence_url,
         )
         self.prophecies[u256(prophecy_id)] = new_record
 
@@ -359,7 +428,6 @@ claim is not falsifiable, not related to the warning, or the JSON is malformed.
         if record.status == STATUS_RATIFIED:
             record.status = STATUS_UNDERWRITING
         self.prophecies[u256(prophecy_id)] = record
-        print("DEBUG provide_liquidity: done")
 
     @gl.public.write.payable
     def buy_coverage(self, prophecy_id: int) -> None:
@@ -396,6 +464,14 @@ claim is not falsifiable, not related to the warning, or the JSON is malformed.
     # and validators disagreeing on wording (not substance) must not block
     # consensus (verified empirically - prompt_comparative here produced
     # MAJORITY_DISAGREE/UNDETERMINED on StudioNet for this exact reason).
+    #
+    # Timing: resolution cannot be triggered before resolution_window_start
+    # opens - this is checked deterministically, before any nondet call, so
+    # it costs nothing to reject and never depends on model judgment. The
+    # window bounds are also passed into the prompt so validators reject
+    # stale/replayed evidence describing an event outside the warned window
+    # (e.g. citing an older, unrelated incident to fraudulently claim a
+    # newer prophecy) even though occurred/linked can't match exactly.
     # ------------------------------------------------------------------
     @gl.public.write
     def trigger_resolution(self, prophecy_id: int, evidence_url: str) -> None:
@@ -405,9 +481,17 @@ claim is not falsifiable, not related to the warning, or the JSON is malformed.
         if not evidence_url:
             raise gl.vm.UserError("EXPECTED: evidence_url is required")
 
+        window_start_dt = _parse_iso_datetime(record.prophecy.resolution_window_start)
+        if datetime.now(timezone.utc) < window_start_dt:
+            raise gl.vm.UserError(
+                f"EXPECTED: resolution window has not opened yet "
+                f"(starts {record.prophecy.resolution_window_start})"
+            )
+
         claim = record.prophecy.structured_claim
         standard = record.prophecy.evidentiary_standard
         original_quote = record.warning.quote_text
+        window_start = record.prophecy.resolution_window_start
         window_end = record.prophecy.resolution_window_end
 
         def fetch_evidence() -> str:
@@ -428,6 +512,10 @@ claim is not falsifiable, not related to the warning, or the JSON is malformed.
 {standard}
 </evidentiary_standard>
 
+<resolution_window_start>
+{window_start}
+</resolution_window_start>
+
 <resolution_window_end>
 {window_end}
 </resolution_window_end>
@@ -445,7 +533,12 @@ claim is not falsifiable, not related to the warning, or the JSON is malformed.
 You are an AI validator resolving a parametric insurance claim about a warning
 that may or may not have come true. Judge two separate questions:
 1. occurred - did an event matching the structured_claim's event class actually
-   happen, per the evidentiary_standard, based on the evidence_content?
+   happen, per the evidentiary_standard, based on the evidence_content, AND
+   does its timing fall within the resolution window (resolution_window_start
+   to resolution_window_end)? Evidence describing an event clearly outside
+   that window - including reused evidence from an older, unrelated incident
+   that happens to match the event class - does not satisfy this claim, even
+   if the event class matches; treat it as not occurred within this window.
 2. linked - if it occurred, is there a genuine causal or thematic link between
    the original_warning and what happened, as opposed to an unrelated coincidence?
 
@@ -462,9 +555,11 @@ It is mandatory that you respond only using the JSON format above, nothing else.
 The output is valid JSON with exactly the three required keys, occurred and
 linked are booleans, rationale is a non-empty string. The occurred/linked
 conclusion is a reasonable, well-supported reading of the evidence_content
-given the structured_claim and evidentiary_standard - reject only if the
-conclusion contradicts the evidence_content or ignores the evidentiary_standard,
-not merely because the rationale is phrased differently than you would phrase it.
+given the structured_claim, evidentiary_standard, and resolution window -
+reject only if the conclusion contradicts the evidence_content, ignores the
+evidentiary_standard, or ignores whether the evidenced event's timing falls
+within the resolution window, not merely because the rationale is phrased
+differently than you would phrase it.
 """
 
         raw = gl.eq_principle.prompt_non_comparative(
@@ -478,61 +573,78 @@ not merely because the rationale is phrased differently than you would phrase it
                 raise gl.vm.UserError(f"LLM_ERROR: trigger_resolution missing field '{key}'")
 
         record.resolution = ResolutionResult(
-            occurred=bool(parsed["occurred"]),
-            linked=bool(parsed["linked"]),
+            occurred=_strict_bool(parsed["occurred"], "occurred"),
+            linked=_strict_bool(parsed["linked"], "linked"),
             rationale=str(parsed["rationale"]),
             resolved_at=_now_iso(),
         )
+        record.evidence_url = evidence_url
         record.status = STATUS_RESOLVING
         self.prophecies[u256(prophecy_id)] = record
 
     # ------------------------------------------------------------------
-    # SETTLE - deterministic once ResolutionResult is finalized (no further
-    # non-determinism at this point), but no longer pure arithmetic: this
-    # is where real GEN actually moves, via `_Recipient(addr).emit_transfer`.
+    # SETTLE - deterministic once ResolutionResult is finalized, but no
+    # longer pure arithmetic: this is where real GEN actually moves, via
+    # `_Recipient(addr).emit_transfer`. Shared by both the direct path
+    # (settle(), from RESOLVING) and the post-appeal path
+    # (finalize_appeal(), from DISPUTED) so a transfer only ever fires once
+    # per prophecy, using whichever resolution is final at that point.
     #
     # Economics (design spec section 1.1/1.2 - LPs earn premium yield when
     # the warning is false, bear payout risk when it's true):
-    #   Vindicated:     prophet gets prophet_cut_bps of total_coverage;
-    #                   each coverage holder is paid their full coverage
-    #                   amount, funded from the combined pool. LPs receive
-    #                   nothing further - their staked liquidity is what
-    #                   backed the claim. (total_coverage <= total_liquidity
-    #                   is enforced at buy_coverage time, so this payout can
-    #                   never exceed total_liquidity + total_coverage.)
+    #   Vindicated:     prophet gets prophet_cut_bps of total_coverage,
+    #                   deducted from the coverage pool (not paid on top of
+    #                   it) - each coverage holder gets their pro-rata share
+    #                   of what's left, so prophet_share + sum(payouts) ==
+    #                   total_coverage exactly (up to floor-division dust).
+    #                   The earlier version paid the FULL total_coverage to
+    #                   holders AND an extra prophet_share on top, which
+    #                   over-paid beyond what buyers actually deposited -
+    #                   the excess was quietly funded out of the LP-backed
+    #                   liquidity pool with no accounting for it. LPs get
+    #                   nothing further - their staked liquidity is the
+    #                   capital that backed the claim, consumed by it.
     #   Not vindicated: no claim is paid. Each LP is repaid their principal
     #                   plus a pro-rata share of total_coverage (the
     #                   premiums) as yield. Coverage buyers get nothing
     #                   back - their premium was the cost of coverage that
     #                   didn't pay out.
+    # All positions for this prophecy are zeroed after settlement (whether
+    # paid or forfeited) so reads never show a stale balance for money that
+    # has already moved or been consumed - this also fixes the frontend
+    # Portfolio view continuing to show a position after settlement.
     # ------------------------------------------------------------------
-    @gl.public.write
-    def settle(self, prophecy_id: int) -> None:
-        record = self._require_prophecy(prophecy_id)
-        if record.status != STATUS_RESOLVING:
-            raise gl.vm.UserError("EXPECTED: pool is not RESOLVING, cannot settle")
-
+    def _execute_settlement(self, prophecy_id: int, record: ProphecyRecord) -> None:
         vindicated = record.resolution.occurred and record.resolution.linked
         key = u256(prophecy_id)
 
         if vindicated:
             prophet_share = (record.total_coverage * record.prophet_cut_bps) // u256(10000)
+            net_coverage_pool = u256(record.total_coverage - prophet_share)
             if prophet_share > u256(0):
                 _Recipient(record.warning.submitter).emit_transfer(value=prophet_share)
 
             coverage_holder_count = 0
-            if key in self.coverage_holders:
+            paid_to_holders = u256(0)
+            if key in self.coverage_holders and record.total_coverage > u256(0):
                 for holder in self.coverage_holders[key]:
                     coverage_holder_count += 1
-                    payout = self.coverage_positions.get(
-                        self._position_key(prophecy_id, holder), u256(0)
-                    )
-                    if payout > u256(0):
-                        _Recipient(holder).emit_transfer(value=payout)
+                    pos_key = self._position_key(prophecy_id, holder)
+                    position = self.coverage_positions.get(pos_key, u256(0))
+                    if position > u256(0):
+                        payout = u256((position * net_coverage_pool) // record.total_coverage)
+                        if payout > u256(0):
+                            _Recipient(holder).emit_transfer(value=payout)
+                            paid_to_holders = u256(paid_to_holders + payout)
+                    self.coverage_positions[pos_key] = u256(0)
+
+            if key in self.lp_holders:
+                for holder in self.lp_holders[key]:
+                    self.lp_positions[self._position_key(prophecy_id, holder)] = u256(0)
 
             record.resolution.rationale += (
                 f" | SETTLED: vindicated, prophet_share={prophet_share} GEN paid, "
-                f"{record.total_coverage} GEN paid across {coverage_holder_count} coverage holder(s)"
+                f"{paid_to_holders} GEN paid across {coverage_holder_count} coverage holder(s)"
             )
         else:
             paid_to_lps = u256(0)
@@ -540,15 +652,18 @@ not merely because the rationale is phrased differently than you would phrase it
             if key in self.lp_holders and record.total_liquidity > u256(0):
                 for holder in self.lp_holders[key]:
                     lp_holder_count += 1
-                    principal = self.lp_positions.get(
-                        self._position_key(prophecy_id, holder), u256(0)
-                    )
-                    if principal == u256(0):
-                        continue
-                    yield_share = (principal * record.total_coverage) // record.total_liquidity
-                    payout = u256(principal + yield_share)
-                    _Recipient(holder).emit_transfer(value=payout)
-                    paid_to_lps = u256(paid_to_lps + payout)
+                    pos_key = self._position_key(prophecy_id, holder)
+                    principal = self.lp_positions.get(pos_key, u256(0))
+                    if principal > u256(0):
+                        yield_share = (principal * record.total_coverage) // record.total_liquidity
+                        payout = u256(principal + yield_share)
+                        _Recipient(holder).emit_transfer(value=payout)
+                        paid_to_lps = u256(paid_to_lps + payout)
+                    self.lp_positions[pos_key] = u256(0)
+
+            if key in self.coverage_holders:
+                for holder in self.coverage_holders[key]:
+                    self.coverage_positions[self._position_key(prophecy_id, holder)] = u256(0)
 
             record.resolution.rationale += (
                 f" | SETTLED: not vindicated, {paid_to_lps} GEN (principal + premium yield) "
@@ -558,30 +673,163 @@ not merely because the rationale is phrased differently than you would phrase it
         record.status = STATUS_SETTLED
         self.prophecies[u256(prophecy_id)] = record
 
+    @gl.public.write
+    def settle(self, prophecy_id: int) -> None:
+        record = self._require_prophecy(prophecy_id)
+        if record.status != STATUS_RESOLVING:
+            raise gl.vm.UserError("EXPECTED: pool is not RESOLVING, cannot settle")
+        self._execute_settlement(prophecy_id, record)
+
     # ------------------------------------------------------------------
-    # APPEAL - marks a resolution as disputed. The larger-validator-set
-    # re-run is invoked at the transaction/consensus layer via
-    # `genlayer appeal <txId>`, not in-contract.
+    # APPEAL - authorized, validator-adjudicated, and always effective
+    # before any transfer:
+    #   - appeal() only accepts RESOLVING (never SETTLED) - once settle()
+    #     has run, GEN has already moved and can't be clawed back on-chain,
+    #     so an appeal must be raised before that point, not after.
+    #   - appeal() requires standing: only the original warning submitter,
+    #     a coverage holder, or an LP for this specific prophecy may appeal.
+    #     Previously any address at all could dispute any prophecy.
+    #   - finalize_appeal() no longer accepts a caller-supplied `upheld`
+    #     bool - that let any single caller decide the outcome unilaterally
+    #     with zero adjudication. It now re-fetches the same evidence and
+    #     runs a fresh equivalence-principle judgment (occurred/linked),
+    #     then immediately executes settlement from that corrected verdict
+    #     - so the appeal's effect is baked into the resolution before the
+    #     one and only transfer for this prophecy ever fires.
     # ------------------------------------------------------------------
     @gl.public.write
     def appeal(self, prophecy_id: int, reason: str) -> None:
         record = self._require_prophecy(prophecy_id)
-        if record.status not in (STATUS_RESOLVING, STATUS_SETTLED):
-            raise gl.vm.UserError("EXPECTED: nothing to appeal in current status")
+        if record.status != STATUS_RESOLVING:
+            raise gl.vm.UserError(
+                "EXPECTED: prophecy must be RESOLVING (before settlement) to be appealed"
+            )
         if not reason:
             raise gl.vm.UserError("EXPECTED: reason is required")
+
+        sender = gl.message.sender_address
+        has_standing = (
+            sender == record.warning.submitter
+            or self.coverage_positions.get(self._position_key(prophecy_id, sender), u256(0)) > u256(0)
+            or self.lp_positions.get(self._position_key(prophecy_id, sender), u256(0)) > u256(0)
+        )
+        if not has_standing:
+            raise gl.vm.UserError(
+                "EXPECTED: only the warning's submitter, a coverage holder, or an LP may appeal"
+            )
+
         record.status = STATUS_DISPUTED
-        record.resolution.rationale += f" | DISPUTED: {reason}"
+        record.resolution.rationale += f" | DISPUTED by {sender.as_hex}: {reason}"
         self.prophecies[u256(prophecy_id)] = record
 
     @gl.public.write
-    def finalize_appeal(self, prophecy_id: int, upheld: bool) -> None:
+    def finalize_appeal(self, prophecy_id: int) -> None:
         record = self._require_prophecy(prophecy_id)
         if record.status != STATUS_DISPUTED:
             raise gl.vm.UserError("EXPECTED: prophecy is not under DISPUTED status")
-        record.status = STATUS_SETTLED if upheld else STATUS_FINAL
-        record.resolution.rationale += f" | APPEAL_RESOLVED: upheld={upheld}"
-        self.prophecies[u256(prophecy_id)] = record
+        if not record.evidence_url:
+            raise gl.vm.UserError("EXPECTED: no evidence on record to re-adjudicate")
+
+        claim = record.prophecy.structured_claim
+        standard = record.prophecy.evidentiary_standard
+        original_quote = record.warning.quote_text
+        window_start = record.prophecy.resolution_window_start
+        window_end = record.prophecy.resolution_window_end
+        evidence_url = record.evidence_url
+        original_occurred = record.resolution.occurred
+        original_linked = record.resolution.linked
+
+        def fetch_evidence() -> str:
+            try:
+                evidence_text = gl.nondet.web.render(evidence_url, mode="text")
+            except Exception as exc:
+                raise gl.vm.UserError(f"EXTERNAL: could not fetch evidence_url on appeal: {exc}")
+            return f"""
+<original_warning>
+{original_quote}
+</original_warning>
+
+<structured_claim>
+{claim}
+</structured_claim>
+
+<evidentiary_standard>
+{standard}
+</evidentiary_standard>
+
+<resolution_window_start>
+{window_start}
+</resolution_window_start>
+
+<resolution_window_end>
+{window_end}
+</resolution_window_end>
+
+<evidence_url>
+{evidence_url}
+</evidence_url>
+
+<evidence_content>
+{evidence_text}
+</evidence_content>
+
+<original_ruling>
+occurred={original_occurred}, linked={original_linked}
+</original_ruling>
+"""
+
+        task = """
+You are an AI validator conducting an APPEAL REVIEW of a disputed parametric
+insurance resolution - a fresh, independent re-examination with higher
+scrutiny than the original resolution. Judge the same two questions again,
+from evidence_content alone - do not defer to original_ruling, which may be
+wrong; that is the entire point of the appeal:
+1. occurred - did an event matching the structured_claim's event class
+   actually happen, per the evidentiary_standard, based on evidence_content,
+   and does its timing fall within the resolution window
+   (resolution_window_start to resolution_window_end)?
+2. linked - if it occurred, is there a genuine causal or thematic link
+   between the original_warning and what happened?
+
+Respond in strict JSON:
+{
+  "occurred": true or false,
+  "linked": true or false,
+  "rationale": "self-contained explanation a reader could verify independently"
+}
+It is mandatory that you respond only using the JSON format above, nothing else.
+"""
+
+        criteria = """
+The output is valid JSON with exactly the three required keys, occurred and
+linked are booleans, rationale is a non-empty string. The occurred/linked
+conclusion is a reasonable, well-supported reading of evidence_content given
+the structured_claim, evidentiary_standard, and resolution window - reject
+only if the conclusion contradicts evidence_content, ignores the
+evidentiary_standard, or ignores whether the evidenced event's timing falls
+within the resolution window.
+"""
+
+        raw = gl.eq_principle.prompt_non_comparative(
+            fetch_evidence,
+            task=task,
+            criteria=criteria,
+        )
+        parsed = _parse_json_object(raw)
+        for key in ("occurred", "linked", "rationale"):
+            if key not in parsed:
+                raise gl.vm.UserError(f"LLM_ERROR: finalize_appeal missing field '{key}'")
+
+        record.resolution = ResolutionResult(
+            occurred=_strict_bool(parsed["occurred"], "occurred"),
+            linked=_strict_bool(parsed["linked"], "linked"),
+            rationale=record.resolution.rationale + " | APPEAL_REVIEW: " + str(parsed["rationale"]),
+            resolved_at=_now_iso(),
+        )
+        # The appeal review is final - settle immediately from this
+        # corrected verdict so no further appeal, and no second transfer,
+        # is ever possible for this prophecy.
+        self._execute_settlement(prophecy_id, record)
 
     # ------------------------------------------------------------------
     # Reads

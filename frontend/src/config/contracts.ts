@@ -1,7 +1,7 @@
 // Deployed CASSANDRA contract on StudioNet (chain id 61999).
 // Redeploy notes live in the repo root build brief; update this address
 // whenever `genlayer deploy` is run again.
-export const CASSANDRA_ADDRESS = (import.meta.env.VITE_CASSANDRA_ADDRESS as `0x${string}`) ?? "0xaa7F8f52228B6001DbC276397B4519F3EA05FFB0";
+export const CASSANDRA_ADDRESS = (import.meta.env.VITE_CASSANDRA_ADDRESS as `0x${string}`) ?? "0x128A3ce1dfa92D15392E292Cd661B5680F08F31A";
 
 export const CATEGORIES = [
   "security",

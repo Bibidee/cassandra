@@ -15,6 +15,16 @@ Written as a pytest test for the same reason as test_canonical_lifecycle.py:
 gltest's get_contract_factory()/get_accounts() need a pytest session.
 Paced with short sleeps between rounds to stay under StudioNet's public
 RPC rate limits (500 req/hour, 8 concurrent execution slots).
+
+STALE as of the value-flow/source-verification review fix: this script's
+source_url values are all placeholder "https://example.com/warning-N" pages
+that don't contain the quoted warning text. draft_prophecy now fetches and
+verifies source_url against warning_quote before drafting, so every scenario
+below will fail at the draft step if run against a contract built from the
+current contracts/cassandra.py. Kept as a historical record of how the
+original canonical deployment was populated; a rerun against a fresh
+deployment needs real, quote-supporting source URLs (see tests/test_five_verdicts.py
+or tests/test_review_fixes.py for the current pattern).
 """
 
 import time

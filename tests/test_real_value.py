@@ -15,10 +15,15 @@ def test_provide_liquidity_moves_real_gen():
     factory = get_contract_factory("Cassandra")
     contract = factory.deploy()
 
+    # draft_prophecy now fetches source_url and requires the model to verify
+    # it genuinely supports the quote before drafting, so this needs a real,
+    # fetchable source rather than a placeholder domain.
     submit_result = contract.submit_warning(
         args=[
-            "https://example.com/real-value-test",
-            "Testing that provide_liquidity actually receives GEN.",
+            "https://rekt.news/ronin-rekt/",
+            "Ronin Network's bridge relied on only 5 of 9 validator signatures to "
+            "authorize withdrawals, allowing an attacker who compromised 5 keys to "
+            "drain 173,600 ETH and 25.5M USDC undetected for six days.",
             "security",
             500,
         ]

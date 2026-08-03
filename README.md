@@ -12,7 +12,7 @@ Every resolution rationale is stored on-chain in full.
 
 ## Architecture
 
-- **Contract**: single GenLayer Intelligent Contract (`contracts/cassandra.py`) deployed on StudioNet at `0xaa7F8f52228B6001DbC276397B4519F3EA05FFB0`
+- **Contract**: single GenLayer Intelligent Contract (`contracts/cassandra.py`) deployed on StudioNet at `0x128A3ce1dfa92D15392E292Cd661B5680F08F31A`
 - **Frontend**: Vite + React + TypeScript + react-router-dom, deployed on Vercel
 - **No backend, no database, no indexer** - everything reads directly from the contract RPC
 
@@ -55,7 +55,7 @@ npm run dev
 Copy `frontend/.env.local.example` to `frontend/.env.local` and set:
 
 ```
-VITE_CASSANDRA_ADDRESS=0xaa7F8f52228B6001DbC276397B4519F3EA05FFB0
+VITE_CASSANDRA_ADDRESS=0x128A3ce1dfa92D15392E292Cd661B5680F08F31A
 VITE_GENLAYER_RPC=https://studio.genlayer.com/api
 VITE_GENLAYER_CHAIN_ID=61999
 ```
@@ -87,6 +87,6 @@ Set these environment variables in the Vercel project settings:
 
 | Key | Value |
 |---|---|
-| `VITE_CASSANDRA_ADDRESS` | `0xaa7F8f52228B6001DbC276397B4519F3EA05FFB0` |
+| `VITE_CASSANDRA_ADDRESS` | `0x128A3ce1dfa92D15392E292Cd661B5680F08F31A` |
 | `VITE_GENLAYER_RPC` | `https://studio.genlayer.com/api` |
 | `VITE_GENLAYER_CHAIN_ID` | `61999` |
