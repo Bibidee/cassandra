@@ -8,7 +8,7 @@ Parametric insurance that pays out when documented public warnings come true, ad
 |---|---|
 | GitHub | https://github.com/Bibidee/cassandra |
 | Live app | https://the-cassandra.vercel.app |
-| Contract explorer | https://genlayer-explorer.vercel.app/address/0x128A3ce1dfa92D15392E292Cd661B5680F08F31A |
+| Contract explorer | https://explorer-studio.genlayer.com/address/0x128A3ce1dfa92D15392E292Cd661B5680F08F31A |
 | Contract address | `0x128A3ce1dfa92D15392E292Cd661B5680F08F31A` |
 | Network | GenLayer StudioNet (chain id 61999) |
 | RPC | https://studio.genlayer.com/api |
